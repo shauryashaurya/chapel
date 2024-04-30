@@ -73,23 +73,46 @@ CLASS_BEGIN(Location)
                LineColumnPair, return std::make_tuple(node.lastLine(), node.lastColumn()))
   PLAIN_GETTER(Location, path, "Get the file path of this Location",
                chpl::UniqueString, return node.path())
+  METHOD(Location, clamp_left, "Get a new Location removes the left part of the current Location based on another Location",
+         chpl::Location(chpl::Location),
+         auto left = node;
+         auto right = std::get<0>(args);
+
+         return Location(left.path(), std::max(left.start(), right.start()), left.end());
+  )
 CLASS_END(Location)
 
 CLASS_BEGIN(Scope)
   PLAIN_GETTER(Scope, used_imported_modules, "Get the modules that were used or imported in this scope",
                std::vector<const chpl::uast::Module*>,
 
-               auto& moduleIds = resolution::findUsedImportedModules(context, node);
+               auto& moduleIds = resolution::findUsedImportedIds(context, node);
                std::set<ID> reportedIds;
                std::vector<const chpl::uast::Module*> toReturn;
                for (size_t i = 0; i < moduleIds.size(); i++) {
                  auto& id = moduleIds[i];
                  if (!reportedIds.insert(id).second) continue;
                  auto ast = parsing::idToAst(context, id);
-                 auto mod = ast->toModule();
-                 CHPL_ASSERT(mod != nullptr);
-                 toReturn.push_back(mod);
+                 if (auto mod = ast->toModule()) toReturn.push_back(mod);
                }
+               return toReturn)
+  PLAIN_GETTER(Scope, parent_scope, "Get the parent (outer) scope of this scope",
+               Nilable<const chpl::resolution::Scope*>, return node->parentScope())
+  PLAIN_GETTER(Scope, visible_nodes, "Get the nodes corresponding to declarations exported from this scope",
+               std::vector<VisibleSymbol>,
+               std::vector<VisibleSymbol> toReturn;
+               for (auto& pair : getSymbolsAvailableInScope(context, node)) {
+                 std::vector<const chpl::uast::AstNode*> into;
+                 for (auto id : pair.second) {
+                    if (id.isEmpty()) continue;
+                    into.push_back(parsing::idToAst(context, id));
+                 }
+
+                 if (!into.empty()) {
+                   toReturn.emplace_back(pair.first, std::move(into));
+                 }
+               }
+
                return toReturn)
 CLASS_END(Scope)
 

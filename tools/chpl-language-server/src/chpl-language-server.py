@@ -198,17 +198,28 @@ def decl_kind_to_completion_kind(kind: SymbolKind) -> CompletionItemKind:
 
 
 def completion_item_for_decl(
-    decl: chapel.NamedDecl,
+    decl: chapel.NamedDecl, override_name: Optional[str] = None
 ) -> Optional[CompletionItem]:
     kind = decl_kind(decl)
     if not kind:
         return None
 
+    # For now, we show completion for global symbols (not x.<complete>),
+    # so it seems like we ought to rule out methods.
+    if kind == SymbolKind.Method:
+        return None
+
+    # We don't want to show operators in completion lists, as they're
+    # not really useful to the user in this context.
+    if kind == SymbolKind.Operator:
+        return None
+
+    name_to_use = override_name if override_name else decl.name()
     return CompletionItem(
-        label=decl.name(),
+        label=name_to_use,
         kind=decl_kind_to_completion_kind(kind),
-        insert_text=decl.name(),
-        sort_text=decl.name(),
+        insert_text=name_to_use,
+        sort_text=name_to_use,
     )
 
 
@@ -235,48 +246,6 @@ def get_symbol_information(
             loc, str(signature), kind, deprecated=is_deprecated
         )
     return None
-
-
-def range_to_tokens(
-    rng: chapel.Location, lines: List[str]
-) -> List[Tuple[int, int, int]]:
-    """
-    Convert a Chapel location to a list of token-compatible ranges. If a location
-    spans multiple lines, it gets split into multiple tokens. The lines
-    and columns are zero-indexed.
-
-    Returns a list of (line, column, length).
-    """
-
-    (line_start, char_start) = rng.start()
-    (line_end, char_end) = rng.end()
-
-    if line_start == line_end:
-        return [(line_start - 1, char_start - 1, char_end - char_start)]
-
-    tokens = [
-        (
-            line_start - 1,
-            char_start - 1,
-            len(lines[line_start - 1]) - char_start,
-        )
-    ]
-    for line in range(line_start + 1, line_end):
-        tokens.append((line - 1, 0, len(lines[line - 1])))
-    tokens.append((line_end - 1, 0, char_end - 1))
-
-    return tokens
-
-
-def range_to_text(rng: chapel.Location, lines: List[str]) -> str:
-    """
-    Convert a Chapel location to a string. If the location spans multiple
-    lines, it gets truncated into 1 line.
-    """
-    text = []
-    for line, column, length in range_to_tokens(rng, lines):
-        text.append(lines[line][column : column + length + 1])
-    return " ".join([t.strip() for t in text])
 
 
 def encode_deltas(
@@ -439,6 +408,8 @@ class EndMarkerPattern:
                         chapel.Sync,
                         chapel.Local,
                         chapel.Manage,
+                        chapel.Select,
+                        chapel.When,
                     ]
                 ),
                 header_location=lambda node: (
@@ -505,6 +476,10 @@ CallInTypeContext = Tuple[chapel.FnCall, Optional[chapel.TypedSignature]]
 CallsInTypeContext = List[CallInTypeContext]
 
 
+# We should show these variables in autocompletion even though they are 'nodoc'.
+_ALLOWED_NODOC_DECLS = ["boundKind", "here", "strideKind"]
+
+
 @dataclass
 @visitor
 class FileInfo:
@@ -523,7 +498,7 @@ class FileInfo:
     ] = field(init=False)
     siblings: chapel.SiblingMap = field(init=False)
     used_modules: List[chapel.Module] = field(init=False)
-    possibly_visible_decls: List[chapel.NamedDecl] = field(init=False)
+    visible_decls: List[Tuple[str, chapel.AstNode]] = field(init=False)
 
     def __post_init__(self):
         self.use_segments = PositionList(lambda x: x.ident.rng)
@@ -591,17 +566,61 @@ class FileInfo:
             if scope:
                 self.used_modules.extend(scope.used_imported_modules())
 
-    def _collect_possibly_visible_decls(self):
-        self.possibly_visible_decls = []
-        for mod in self.used_modules:
-            for child in mod:
-                if not isinstance(child, chapel.NamedDecl):
+    def _collect_possibly_visible_decls(self, asts: List[chapel.AstNode]):
+        self.visible_decls = []
+        for ast in asts:
+            if isinstance(ast, chapel.Comment):
+                continue
+
+            scope = ast.scope()
+            if not scope:
+                continue
+
+            file = ast.location().path()
+            in_bundled_module = self.context.context.is_bundled_path(file)
+
+            for name, nodes in scope.visible_nodes():
+                # Don't show internal symbols to the user, even if they
+                # are technically in scope. The exception is if we're currently
+                # editing a standard file.
+                skip_prefixes = ["chpl_", "chpldev_", "_"]
+                if any(name.startswith(prefix) for prefix in skip_prefixes):
+                    if not in_bundled_module:
+                        continue
+
+                # Only show nodes without @chpldoc.nodoc. The exception
+                # about standard files applies here too.
+                documented_nodes = []
+                for node in nodes:
+                    # apply aforementioned exception
+                    if in_bundled_module:
+                        documented_nodes.append(node)
+                        continue
+
+                    # avoid nodes with nodoc attribute.
+                    ag = node.attribute_group()
+                    show = False
+                    if not ag or not ag.get_attribute_named("chpldoc.nodoc"):
+                        show = True
+                    elif name in _ALLOWED_NODOC_DECLS:
+                        # If users declare variables like 'here' themselves,
+                        # we will not show them if they're @chpldoc.nodoc,
+                        # since they're not special.
+                        decl_file = node.location().path()
+                        is_standard_decl = self.context.context.is_bundled_path(
+                            decl_file
+                        )
+                        show = is_standard_decl
+
+                    if show:
+                        documented_nodes.append(node)
+
+                if len(documented_nodes) == 0:
                     continue
 
-                if child.visibility() == "private":
-                    continue
-
-                self.possibly_visible_decls.append(child)
+                # Just take the first value to avoid showing N entries for
+                # overloaded functions.
+                self.visible_decls.append((name, documented_nodes[0]))
 
     def _search_instantiations(
         self,
@@ -659,7 +678,7 @@ class FileInfo:
 
         self.siblings = chapel.SiblingMap(asts)
         self._collect_used_modules(asts)
-        self._collect_possibly_visible_decls()
+        self._collect_possibly_visible_decls(asts)
 
         if self.use_resolver:
             with self.context.context.track_errors() as _:
@@ -1237,7 +1256,7 @@ class ChapelLanguageServer(LanguageServer):
             )
             if dead_branch:
                 loc = dead_branch.location()
-                return range_to_tokens(loc, lines)
+                return chapel.range_to_tokens(loc, lines)
 
         return []
 
@@ -1358,7 +1377,8 @@ class ChapelLanguageServer(LanguageServer):
                 if re.search(self._curly_bracket_with_comment, curly_line):
                     continue
 
-                text = range_to_text(header_loc, file_lines)
+                text = chapel.range_to_lines(header_loc, file_lines)
+                text = " ".join([t.strip() for t in text])
                 loc = location_to_location(goto_loc) if goto_loc else None
                 to_insert = " // " + text
                 edit = TextEdit(
@@ -1528,9 +1548,9 @@ def run_lsp():
         fi, _ = ls.get_file_info(text_doc.uri)
 
         items = []
-        items.extend(
-            completion_item_for_decl(decl) for decl in fi.possibly_visible_decls
-        )
+        for name, decl in fi.visible_decls:
+            if isinstance(decl, chapel.NamedDecl):
+                items.append(completion_item_for_decl(decl, override_name=name))
         items.extend(completion_item_for_decl(mod) for mod in fi.used_modules)
 
         items = [item for item in items if item]
@@ -1646,7 +1666,8 @@ def run_lsp():
     async def document_highlight(
         ls: ChapelLanguageServer, params: DocumentHighlightParams
     ):
-        text_doc = ls.workspace.get_text_document(params.text_document.uri)
+        text_doc_uri = params.text_document.uri
+        text_doc = ls.workspace.get_text_document(text_doc_uri)
 
         fi, _ = ls.get_file_info(text_doc.uri)
 
@@ -1655,13 +1676,16 @@ def run_lsp():
             return None
 
         # todo: it would be nice if this differentiated between read and write
-        highlights = [
-            DocumentHighlight(node_and_loc.rng, DocumentHighlightKind.Text)
+        highlights = []
+        # only highlight the declaration if it is in the current document
+        if node_and_loc.get_uri() == text_doc_uri:
+            dh = DocumentHighlight(node_and_loc.rng, DocumentHighlightKind.Text)
+            highlights.append(dh)
+        uses = fi.uses_here.get(node_and_loc.node.unique_id(), [])
+        highlights += [
+            DocumentHighlight(use.rng, DocumentHighlightKind.Text)
+            for use in uses
         ]
-        for use in fi.uses_here.get(node_and_loc.node.unique_id(), []):
-            highlights.append(
-                DocumentHighlight(use.rng, DocumentHighlightKind.Text)
-            )
 
         return highlights
 

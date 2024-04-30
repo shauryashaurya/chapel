@@ -226,8 +226,7 @@ static QualifiedType primFieldByNum(Context* context, const CallInfo& ci) {
 static QualifiedType primCallResolves(Context* context, const CallInfo &ci,
                                       bool forMethod, bool resolveFn,
                                       const PrimCall* call,
-                                      const Scope* inScope,
-                                      const PoiScope* inPoiScope) {
+                                      const CallScopeInfo& inScopes) {
   if ((forMethod && ci.numActuals() < 2) ||
       (!forMethod && ci.numActuals() < 1)) {
     return QualifiedType();
@@ -255,7 +254,7 @@ static QualifiedType primCallResolves(Context* context, const CallInfo &ci,
                            std::move(actuals));
   auto callResult = context->runAndTrackErrors([&](Context* context) {
     return resolveGeneratedCall(context, call, callInfo,
-                                inScope, inPoiScope);
+                                inScopes);
   });
   const TypedFnSignature* bestCandidate = nullptr;
   for (auto candidate : callResult.result().mostSpecific()) {
@@ -271,7 +270,7 @@ static QualifiedType primCallResolves(Context* context, const CallInfo &ci,
     if (resolveFn) {
       // We did find a candidate; resolve the function body.
       auto bodyResult = context->runAndTrackErrors([&](Context* context) {
-        return resolveFunction(context, bestCandidate, inPoiScope);
+        return resolveFunction(context, bestCandidate, inScopes.poiScope());
       });
       callAndFnResolved &= bodyResult.ranWithoutErrors();
     }
@@ -1210,8 +1209,8 @@ CallResolutionResult resolvePrimCall(Context* context,
         bool resolveFn = prim == PRIM_CALL_AND_FN_RESOLVES ||
                          prim == PRIM_METHOD_CALL_AND_FN_RESOLVES;
 
-        type = primCallResolves(context, ci, forMethod, resolveFn, call,
-                                inScope, inPoiScope);
+        auto inScopes = CallScopeInfo::forNormalCall(inScope, inPoiScope);
+        type = primCallResolves(context, ci, forMethod, resolveFn, call, inScopes);
       }
       break;
 
@@ -1332,7 +1331,8 @@ CallResolutionResult resolvePrimCall(Context* context,
           break;
         } else if (actualType.type()->isStringType() ||
                    actualType.type()->isBytesType() ||
-                   actualType.type()->isCStringType()) {
+                   actualType.type()->isCStringType() ||
+                   actualType.type()->isCPtrType()) {
           // for non-param string/bytes, the return type is just a default int
           type = QualifiedType(QualifiedType::CONST_VAR,
                                IntType::get(context, 0));
@@ -1523,7 +1523,6 @@ CallResolutionResult resolvePrimCall(Context* context,
     case PRIM_AUTO_DESTROY_RUNTIME_TYPE:
     case PRIM_CREATE_FN_TYPE:
     case PRIM_GPU_KERNEL_LAUNCH:
-    case PRIM_GPU_KERNEL_LAUNCH_FLAT:
     case PRIM_GPU_SYNC_THREADS:
     case PRIM_GPU_ELIGIBLE:
     case PRIM_GPU_DEINIT_KERNEL_CFG:
@@ -1531,6 +1530,8 @@ CallResolutionResult resolvePrimCall(Context* context,
     case PRIM_GPU_PID_OFFLOAD:
     case PRIM_GPU_ATTRIBUTE_BLOCK:
     case PRIM_GPU_PRIMITIVE_BLOCK:
+    case PRIM_GPU_BLOCK_REDUCE:
+    case PRIM_GPU_REDUCE_WRAPPER:
       type = QualifiedType(QualifiedType::CONST_VAR,
                            VoidType::get(context));
       break;
@@ -1608,6 +1609,7 @@ CallResolutionResult resolvePrimCall(Context* context,
       break;
 
     case PRIM_GPU_INIT_KERNEL_CFG:
+    case PRIM_GPU_INIT_KERNEL_CFG_3D:
       type = QualifiedType(QualifiedType::CONST_VAR, CPtrType::getCVoidPtrType(context));
       break;
 
@@ -1640,10 +1642,25 @@ CallResolutionResult resolvePrimCall(Context* context,
       type = QualifiedType(QualifiedType::CONST_VAR,
                            CompositeType::getLocaleIDType(context));
       break;
+
+    case PRIM_ARRAY_GET: {
+        if (ci.numActuals() == 2 && ci.actual(0).type().hasTypePtr()) {
+          auto index = ci.actual(1).type();
+          if (index.hasTypePtr() && index.type()->isIntegralType()) {
+            auto act = ci.actual(0).type();
+            if (auto ptr = act.type()->toCPtrType()) {
+              type = QualifiedType(QualifiedType::REF, ptr->eltType());
+            }
+          } else {
+            context->error(call, "bad call to primitive \"%s\": second argument must be an integral type", primTagToName(prim));
+          }
+        }
+      }
+      break;
+
     case PRIM_USED_MODULES_LIST:
     case PRIM_REFERENCED_MODULES_LIST:
     case PRIM_TUPLE_EXPAND:
-    case PRIM_ARRAY_GET:
     case PRIM_MAYBE_LOCAL_THIS:
     case PRIM_MAYBE_LOCAL_ARR_ELEM:
     case PRIM_MAYBE_AGGREGATE_ASSIGN:

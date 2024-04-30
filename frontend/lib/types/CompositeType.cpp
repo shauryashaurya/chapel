@@ -145,7 +145,7 @@ const RecordType* CompositeType::getStringType(Context* context) {
 
 const RecordType* CompositeType::getRangeType(Context* context) {
   auto symbolPath = UniqueString::get(context, "ChapelRange._range");
-  auto name = UniqueString::get(context, "range");
+  auto name = UniqueString::get(context, "_range");
   auto id = ID(symbolPath, -1, 0);
   return RecordType::get(context, id, name,
                          /* instantiatedFrom */ nullptr,
@@ -188,7 +188,7 @@ bool CompositeType::isMissingBundledRecordType(Context* context, ID id) {
   if (noLibrary) {
     auto path = id.symbolPath();
     return path == "String._string" ||
-           path == "ChapelRange.range" ||
+           path == "ChapelRange._range" ||
            path == "Bytes._bytes";
   }
 
@@ -201,7 +201,8 @@ bool CompositeType::isMissingBundledClassType(Context* context, ID id) {
     auto path = id.symbolPath();
     return path == "ChapelReduce.ReduceScanOp" ||
            path == "Errors.Error" || 
-           path == "CTypes.c_ptr";
+           path == "CTypes.c_ptr" ||
+           path == "CTypes.c_ptrConst";
   }
 
   return false;

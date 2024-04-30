@@ -27,6 +27,9 @@
 #include "chpl-comm.h"
 #include <string.h>
 
+// device code for reduction support
+#include "chpl-gpu-dev-reduce.h"
+
 __device__ static inline c_sublocid_t chpl_task_getRequestedSubloc(void)
 {
   // TODO
@@ -38,8 +41,8 @@ __device__ static inline c_sublocid_t chpl_task_getRequestedSubloc(void)
 }
 
 __device__ static inline void* c_pointer_return(void* x) { return x; }
-__device__ static inline void* c_pointer_return_const(const void* x) {
-  return (void*)x;
+__device__ static inline const void* c_pointer_return_const(const void* x) {
+  return x;
 }
 
 __device__ static inline chpl_localeID_t chpl_rt_buildLocaleID(c_nodeid_t node,  c_sublocid_t subloc) {
@@ -138,7 +141,7 @@ __host__ static inline void chpl_gpu_force_sync() {
   chpl_internal_error("chpl_gpu_force_sync called from host");
 }
 
-__host__ static inline void chpl_gpu_force_warp_sync(unsigned mask=0xffffffff) {
+__host__ static inline void chpl_gpu_force_warp_sync(unsigned mask) {
   chpl_internal_error("chpl_gpu_force_warp_sync called from host");
 }
 

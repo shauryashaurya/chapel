@@ -1435,6 +1435,15 @@ GenRet codegenElementPtr(GenRet base, GenRet index, bool ddataPtr=false) {
   if( info->cfile ) {
     base = codegenValue(base); // even for tuple, for style.
     ret.c = "(" + base.c + " + " + index.c + ")";
+    if (baseType->symbol->hasFlag(FLAG_C_PTRCONST_CLASS)) {
+      // For our const C pointer representation, we will codegen the type as
+      // const, but want to use it as non-const most places in the generated C.
+      // This is because the rest of code generation doesn't try to handle C
+      // constness, and we don't want to have to add that support everywhere.
+      // Here, we cast away the constness so this pointer can be assigned into
+      // a non-const call tmp without issue, for dereferencing or other use.
+      ret.c = "((void*)" + ret.c + ")";
+    }
   } else {
 #ifdef HAVE_LLVM
     unsigned AS = base.val->getType()->getPointerAddressSpace();
@@ -2769,11 +2778,7 @@ static GenRet codegenCallExprInner(GenRet genFn, std::vector<GenRet>& args,
 
     // Emit the indirect call.
     llvm::CallInst* c = nullptr;
-    #if HAVE_LLVM_VER >= 90
     c = info->irBuilder->CreateCall(fnType, val, llArgs);
-    #else
-    c = info->irBuilder->CreateCall(val, llArgs);
-    #endif
 
     ret.val = c;
 
@@ -3120,11 +3125,7 @@ static GenRet codegenCallExprInner(GenRet function,
       c = info->irBuilder->CreateCall(func, llArgs);
     } else {
       if (!fnType) INT_FATAL("Could not compute called function type");
-#if HAVE_LLVM_VER >= 90
       c = info->irBuilder->CreateCall(fnType, val, llArgs);
-#else
-      c = info->irBuilder->CreateCall(val, llArgs);
-#endif
     }
 
     if (func) {
@@ -3204,7 +3205,9 @@ GenRet codegenCallExprWithArgs(const char* fnName,
   } else {
 #ifdef HAVE_LLVM
     fn.val = getFunctionLLVM(fnName);
-    INT_ASSERT(fn.val);
+    if (fn.val == nullptr) {
+      INT_FATAL(fnSym, "unable to find function %s\n", fnName);
+    }
     return codegenCallExprWithArgs(fn, args, fnName,
                                    fnSym, FD, defaultToValues);
 #endif
@@ -3517,7 +3520,6 @@ void codegenCallMemcpy(GenRet dest, GenRet src, GenRet size,
     llvm::Function *func = llvm::Intrinsic::getDeclaration(info->module, llvm::Intrinsic::memcpy, types);
     //llvm::FunctionType *fnType = func->getFunctionType();
 
-#if HAVE_LLVM_VER >= 70
     // LLVM 7 and later: memcpy has no alignment argument
     llvm::Value* llArgs[4];
 
@@ -3528,21 +3530,6 @@ void codegenCallMemcpy(GenRet dest, GenRet src, GenRet size,
     // LLVM memcpy intrinsic has additional argument isvolatile
     // isVolatile?
     llArgs[3] = llvm::ConstantInt::get(llvm::Type::getInt1Ty(info->module->getContext()), 0, false);
-
-#else
-    // LLVM 6 and earlier: memcpy had alignment argument
-    llvm::Value* llArgs[5];
-
-    llArgs[0] = convertValueToType(dest.val, types[0], false);
-    llArgs[1] = convertValueToType(src.val, types[1], false);
-    llArgs[2] = convertValueToType(size.val, types[2], false);
-
-    // LLVM memcpy intrinsic has additional arguments alignment, isvolatile
-    // alignment
-    llArgs[3] = llvm::ConstantInt::get(llvm::Type::getInt32Ty(info->module->getContext()), 0, false);
-    // isVolatile?
-    llArgs[4] = llvm::ConstantInt::get(llvm::Type::getInt1Ty(info->module->getContext()), 0, false);
-#endif
 
     // We can't use IRBuilder::CreateMemCpy because that adds
     //  a cast to i8 (in address space 0).
@@ -5366,86 +5353,44 @@ static bool isCStringImmediate(Symbol* sym) {
   return false;
 }
 
-static GenRet codegenGPUKernelLaunch(CallExpr* call, bool is3d) {
-  // Used to codegen for PRIM_GPU_KERNEL_LAUNCH_FLAT and PRIM_GPU_KERNEL_LAUNCH.
-  // They differ in number of arguments only. The first passes 1 integer for
-  // grid and block size each, the other passes 3 for each.
-  //
-  // Generates a call to the `chpl_gpu_launch_kernel*` runtime functions.
-  //
-  // The primitive's arguments are
-  //   - function name (c_string immediate) or symbol (FnSymbol)
-  //   - grid size (1 arg or 3 args)
-  //   - block size (1 arg or 3 args)
-  //   - any number of arguments to be passed to the kernel
-  //
-  // Kernel arguments are passed in the following ways:
-  //
-  // 1. If a class: pass by reference. We also pass 0 as size.
-  //    This will cause the runtime to assume that this is a device pointer and
-  //    pass it directly to the kernel. Current semantics with the `on` statements
-  //    guarantees that.
-  // 2. If non-aggregate: same as 1.
-  // 3. If a ref: pass by value, and the size of its value. Runtime will
-  //    offload that value and create a GPU pointer to the offloaded instance.
-  // 4. If aggregate: pass by reference, and the size of its value. The behavior
-  //    will be similar to 3.
-
-  // number of arguments that are not kernel params
-  int nNonKernelParamArgs = is3d ? 7:3;
-
-  const char* fn = is3d ? "chpl_gpu_launch_kernel":"chpl_gpu_launch_kernel_flat";
-
-  std::vector<GenRet> args;
-
-  // "Copy" arguments from primitive call to runtime library function call.
+static GenRet codegenGPUInitKernelCfg(CallExpr* call, const char* fnName) {
   int curArg = 1;
-  for_actuals(actual, call) {
-    Symbol* actualSym = toSymExpr(actual)->symbol();
-    if (curArg == 1) {  // function name or symbol
-      if (FnSymbol* fn = toFnSymbol(actualSym)) {
-        args.push_back(new_CStringSymbol(fn->cname));
-      }
-      else if (isCStringImmediate(actualSym)) {
-        args.push_back(actual->codegen());
-      }
-      else {
-        INT_FATAL("Unknown argument type in GPU launch primitive");
-      }
-    }
-    else if (curArg <= nNonKernelParamArgs) {  // grid and block size args
-      args.push_back(actual->codegen());
-
-    }
-    else { // kernel args
-      // must be the cfg arg
-      args.push_back(actual->codegen());
-    }
-    curArg++;
+  std::vector<GenRet> args;
+  Symbol* kernelFn = toSymExpr(call->get(curArg++))->symbol();
+  if (FnSymbol* fn = toFnSymbol(kernelFn)) {
+    args.push_back(new_CStringSymbol(fn->cname));
+  }
+  else if (isCStringImmediate(kernelFn)) {
+    args.push_back(kernelFn->codegen());
+  }
+  else {
+    INT_FATAL("Unexpected value in kernel initialization primitive");
   }
 
-  return codegenCallExprWithArgs(fn, args);
-}
+  for ( ; curArg<=call->numActuals() ; curArg++) {
+    args.push_back(call->get(curArg)->codegen());
+  }
 
-DEFINE_PRIM(GPU_KERNEL_LAUNCH_FLAT) {
-  ret = codegenGPUKernelLaunch(call, /* is3d= */ false);
-}
-
-DEFINE_PRIM(GPU_KERNEL_LAUNCH) {
-  ret = codegenGPUKernelLaunch(call, /* is3d= */ true);
-}
-
-DEFINE_PRIM(GPU_INIT_KERNEL_CFG) {
-  std::vector<GenRet> args;
-  auto numKernelArgs = call->get(1);
-  auto numKernelPids = call->get(2);
-
-  args.push_back(numKernelArgs->codegen());
-  args.push_back(numKernelPids->codegen());
   args.push_back(new_IntSymbol(call->astloc.lineno()));
   args.push_back(new_IntSymbol(gFilenameLookupCache[call->astloc.filename()]));
 
-  ret = codegenCallExprWithArgs("chpl_gpu_init_kernel_cfg", args);
+  return codegenCallExprWithArgs(fnName, args);
+}
+
+DEFINE_PRIM(GPU_KERNEL_LAUNCH) {
+  ret = codegenCallExpr("chpl_gpu_launch_kernel", call->get(1)->codegen());
+}
+
+DEFINE_PRIM(GPU_INIT_KERNEL_CFG_3D) {
+  const char* fnName = "chpl_gpu_init_kernel_cfg_3d";
+
+  ret = codegenGPUInitKernelCfg(call, fnName);
+}
+
+DEFINE_PRIM(GPU_INIT_KERNEL_CFG) {
+  const char* fnName = "chpl_gpu_init_kernel_cfg";
+
+  ret = codegenGPUInitKernelCfg(call, fnName);
 }
 
 DEFINE_PRIM(GPU_DEINIT_KERNEL_CFG) {
@@ -5475,6 +5420,15 @@ DEFINE_PRIM(GPU_ARG) {
   if ((kind & 1<<1) == GpuArgKind::OFFLOAD) {
     fnName = "chpl_gpu_arg_offload";
     args.push_back(codegenSizeof(call->get(2)->typeInfo()->getValType()));
+
+    // can OFFLOAD and REDUCE be set at the same time?
+    INT_ASSERT((kind & GpuArgKind::REDUCE) == 0);
+  }
+  else if (kind & GpuArgKind::REDUCE) {
+    fnName = "chpl_gpu_arg_reduce";
+    args.push_back(codegenSizeof(call->get(2)->typeInfo()->getValType()));
+    args.push_back(call->get(4)->codegen());
+
   }
   else {
     fnName = "chpl_gpu_arg_pass";
@@ -5490,6 +5444,52 @@ DEFINE_PRIM(GPU_PID_OFFLOAD) {
 
   ret = codegenCallExpr("chpl_gpu_pid_offload", cfg->codegen(),
                         pid->codegen(), size->codegen());
+}
+
+DEFINE_PRIM(GPU_BLOCK_REDUCE) {
+  int curArg = 1;
+  auto fnNameExpr = call->get(curArg++);
+  auto threadData = call->get(curArg++);
+  auto buffer = call->get(curArg++);
+  auto blockSize = call->get(curArg++);
+
+
+  VarSymbol* fnNameSym = toVarSymbol(toSymExpr(fnNameExpr)->symbol());
+  INT_ASSERT(fnNameSym);
+  std::string fnName = fnNameSym->immediate->string_value();
+
+  // append typename
+  fnName += "_" + std::string(threadData->typeInfo()->symbol->cname);
+
+  // specialize for a given block size if statically available
+  if (Immediate* imm = getSymbolImmediate(toSymExpr(blockSize)->symbol())) {
+    fnName += "_" + std::to_string(imm->int_value());
+  }
+
+  ret = codegenCallExpr(fnName.c_str(), threadData->codegen(),
+                        buffer->codegen());
+}
+
+DEFINE_PRIM(GPU_REDUCE_WRAPPER) {
+  // GPU_REDUCE_WRAPPER(c"function name without type", data type, ...)
+  // "..." args are directly passed to the runtime
+  int curArg = 1;
+  VarSymbol* fnNameSym = toVarSymbol(toSymExpr(call->get(curArg++))->symbol());
+  INT_ASSERT(isCStringImmediate(fnNameSym));
+
+  TypeSymbol *redTypeSym = toTypeSymbol(toSymExpr(call->get(curArg++))->symbol());
+  INT_ASSERT(redTypeSym);
+
+  std::vector<GenRet> args;
+  for ( ; curArg<=call->numActuals() ; curArg++) {
+    args.push_back(call->get(curArg)->codegen());
+  }
+
+  std::string fnName = std::string(fnNameSym->immediate->string_value());
+  fnName += "_";
+  fnName += std::string(redTypeSym->cname);
+
+  ret = codegenCallExprWithArgs(fnName.c_str(), args);
 }
 
 DEFINE_PRIM(GPU_THREADIDX_X) { ret = codegenCallExpr("chpl_gpu_getThreadIdxX"); }
